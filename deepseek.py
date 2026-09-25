@@ -70,7 +70,17 @@ def setup_console_utf8() -> None:
 setup_console_utf8()
 
 USE_COLOR = os.getenv("NO_COLOR") != "1"
-USE_UNICODE = False
+
+def _detect_unicode() -> bool:
+    if os.getenv("NO_UNICODE") == "1":
+        return False
+    try:
+        "\u25cf\u25c6\u25ba\u2713\u00e9".encode(sys.stdout.encoding or "utf-8")
+        return True
+    except Exception:
+        return False
+
+USE_UNICODE = _detect_unicode()
 
 
 class Colors:
@@ -102,8 +112,28 @@ class Colors:
     def bold(cls, t: str) -> str:
         return cls._wrap("1", t)
 
+    @classmethod
+    def yellow(cls, t: str) -> str:
+        return cls._wrap("33", t)
 
-SYM = {
+    @classmethod
+    def magenta(cls, t: str) -> str:
+        return cls._wrap("35", t)
+
+    @classmethod
+    def blue(cls, t: str) -> str:
+        return cls._wrap("34", t)
+
+    @classmethod
+    def white(cls, t: str) -> str:
+        return cls._wrap("97", t)
+
+    @classmethod
+    def dim(cls, t: str) -> str:
+        return cls._wrap("2", t)
+
+
+_SYM_ASCII = {
     "dot": ".",
     "star": "*",
     "star2": "*",
@@ -122,7 +152,46 @@ SYM = {
     "claude_dot": "o",
     "claude_tool": ">",
     "claude_bullet": "*",
+    "ok": "+",
+    "fail": "x",
+    "warn": "!",
+    "info": "i",
+    "search": "?",
+    "link": ">",
+    "bar_full": "#",
+    "bar_empty": "-",
 }
+
+_SYM_UNI = {
+    "dot": "\u00b7",
+    "star": "\u2726",
+    "star2": "\u2727",
+    "star3": "\u22c6",
+    "star4": "\u2736",
+    "star5": "\u2737",
+    "bullet": "\u25cf",
+    "circle": "\u25cb",
+    "corner": "\u2514",
+    "box_tl": "\u250c",
+    "box_tr": "\u2510",
+    "box_bl": "\u2514",
+    "box_br": "\u2518",
+    "box_h": "\u2500",
+    "box_v": "\u2502",
+    "claude_dot": "\u25cf",
+    "claude_tool": "\u25ba",
+    "claude_bullet": "\u2022",
+    "ok": "\u2713",
+    "fail": "\u2717",
+    "warn": "\u26a0",
+    "info": "\u2139",
+    "search": "\u2315",
+    "link": "\u2197",
+    "bar_full": "\u2588",
+    "bar_empty": "\u2591",
+}
+
+SYM = _SYM_UNI if USE_UNICODE else _SYM_ASCII
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_DIR = BASE_DIR / "config"
@@ -819,18 +888,41 @@ def osint_entities(text: str) -> Dict[str, List[str]]:
         if len(words) >= 2 and not any(w in _NAME_NOISE for w in words):
             names.append(m.strip())
     for m in _NAME_TITLE_RE.findall(t):
+        words = [w for w in m.split() if w.lower() not in ("d", "de", "da", "do", "dos", "das")]
+        if len(words) < 2:
+            continue
+        if any(w.upper() in _NAME_NOISE for w in words):
+            continue
+        if len(" ".join(words)) < 5:
+            continue
         names.append(m.strip())
     out["names"] = _dedupe(names)[:4]
     return out
+
+
+_OSINT_TRIGGER_RE = re.compile(
+    r"busc|procur|ache|investiga|descobr|osint|dork|quem e|telefone|endereco|"
+    r"cnpj|cpf|perfil|rede social|processo|diario oficial|vazou|vazamento",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_osint_target(q: str) -> bool:
+    """Heuristica rapida: a mensagem parece um pedido de investigacao com alvo?"""
+    try:
+        ent = osint_entities(q or "")
+        if any(ent.values()):
+            return True
+    except Exception:
+        pass
+    return bool(_OSINT_TRIGGER_RE.search(q or ""))
 
 
 _URL_RE = re.compile(r"https?://[^\s'\"<>)\]]+")
 _SKIP_URL = ("google.com", "duckduckgo.com", "gstatic", "googleusercontent", "bing.com", "allorigins")
 
 
-def osint_recon_target(user_text: str) -> str:
-    import concurrent.futures
-
+def _recon_jobs(user_text: str) -> List[Tuple[str, Dict[str, Any]]]:
     ent = osint_entities(user_text)
     jobs: List[Tuple[str, Dict[str, Any]]] = []
     if ent.get("handles"):
@@ -846,47 +938,95 @@ def osint_recon_target(user_text: str) -> str:
         jobs.append(("osint_cnpj", {"cnpj": ent["cnpjs"][0]}))
     if ent.get("phones"):
         jobs.append(("osint_phone", {"phone": ent["phones"][0]}))
+    return jobs
+
+
+def osint_recon_target(user_text: str, progress: Optional[Callable] = None) -> str:
+    import concurrent.futures
+
+    jobs = _recon_jobs(user_text)
     if not jobs:
         return ""
 
+    fn_map = {
+        "osint_handles": tool_osint_handles,
+        "osint_email": tool_osint_email,
+        "osint_domain": tool_osint_domain,
+        "osint_cnpj": tool_osint_cnpj,
+        "osint_phone": tool_osint_phone,
+    }
+    labels = {"osint_handles": "perfis", "osint_email": "e-mail", "osint_domain": "dominio",
+              "osint_cnpj": "cnpj", "osint_phone": "telefone"}
     parts: List[str] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="recon") as ex:
+    total = len(jobs)
+    done = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=total, thread_name_prefix="recon") as ex:
         futs = {}
         for name, args in jobs:
-            fn = TOOLS.get(name)
+            fn = fn_map.get(name) or TOOLS.get(name)
             if fn:
                 futs[ex.submit(fn, args)] = name
-        for fut in concurrent.futures.as_completed(futs, timeout=120):
-            name = futs[fut]
-            try:
-                parts.append(f"=== {name} ===\n{_clip(str(fut.result(timeout=60)), 3500)}")
-            except Exception as e:
-                parts.append(f"=== {name} ===\n erro: {type(e).__name__}: {e}")
+        try:
+            for fut in concurrent.futures.as_completed(futs, timeout=50):
+                name = futs[fut]
+                try:
+                    parts.append(f"=== {name} ===\n{_clip(str(fut.result(timeout=45)), 2800)}")
+                except Exception as e:
+                    parts.append(f"=== {name} ===\n erro: {type(e).__name__}: {e}")
+                done += 1
+                if progress:
+                    try:
+                        progress("recon", done, total, labels.get(name, name))
+                    except Exception:
+                        pass
+        except concurrent.futures.TimeoutError:
+            parts.append("(recon: tempo esgotado, resultados parciais acima)")
     return "\n\n".join(parts)
 
 
-def osint_autopilot(user_text: str, limit: int = 16, fetches: int = 3) -> Tuple[str, List[str]]:
+def osint_autopilot(
+    user_text: str,
+    limit: int = 10,
+    fetches: int = 2,
+    progress: Optional[Callable] = None,
+) -> Tuple[str, List[str]]:
+    """Bateria automatica: dorks em paralelo, depois fetch+recon em paralelo.
+
+    Orcamento total ~95s no pior caso (antes passava de 300s e caia no timeout
+    de 75s do exec_tools). Na pratica roda em 15-40s.
+    """
     import concurrent.futures
 
     dorks = osint_build_dorks(user_text, limit)
     if not dorks:
         return "", []
 
-    search = TOOLS.get("multi_search") or TOOLS.get("google_search") or TOOLS.get("web_search")
-    if not search:
-        return "", []
-
+    # FASE 1 - dorks em paralelo (busca direta, sem lookup em TOOLS)
     blocks: List[str] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="dork") as ex:
-        futs = {ex.submit(search, {"query": d}): d for d in dorks}
-        for fut in concurrent.futures.as_completed(futs, timeout=150):
-            dork = futs[fut]
-            try:
-                res = fut.result(timeout=90)
-            except Exception as e:
-                res = f"erro: {type(e).__name__}: {e}"
-            blocks.append(f"[DORK] {dork}\n{_clip(str(res), 1200)}")
+    total = len(dorks)
+    done = 0
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(10, total), thread_name_prefix="dork"
+    ) as ex:
+        futs = {ex.submit(osint_search_one, d, "auto", 5.0): d for d in dorks}
+        try:
+            for fut in concurrent.futures.as_completed(futs, timeout=45):
+                dork = futs[fut]
+                try:
+                    res = fut.result(timeout=30)
+                except Exception as e:
+                    res = f"erro: {type(e).__name__}: {e}"
+                blocks.append(f"[DORK] {dork}\n{_clip(str(res), 900)}")
+                done += 1
+                if progress:
+                    try:
+                        progress("dorks", done, total, dork)
+                    except Exception:
+                        pass
+        except concurrent.futures.TimeoutError:
+            blocks.append("(tempo esgotado nas buscas: resultados parciais)")
 
+    # FASE 2 - fetch das melhores urls + recon, tudo junto em paralelo
     urls: List[str] = []
     for b in blocks:
         for u in _URL_RE.findall(b):
@@ -895,35 +1035,59 @@ def osint_autopilot(user_text: str, limit: int = 16, fetches: int = 3) -> Tuple[
                 continue
             if u not in urls:
                 urls.append(u)
-    urls = urls[:fetches]
+    urls = urls[:max(fetches, 0)]
 
     fetch_blocks: List[str] = []
-    if urls:
-        fetcher = TOOLS.get("fetch")
-        if fetcher:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="osintfetch") as ex:
-                futs = {ex.submit(fetcher, {"url": u}): u for u in urls}
-                for fut in concurrent.futures.as_completed(futs, timeout=70):
-                    u = futs[fut]
+    recon_parts: List[str] = []
+    jobs = _recon_jobs(user_text)
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(8, max(1, len(urls) + len(jobs))), thread_name_prefix="osint2"
+    ) as ex:
+        fut_fetch = {ex.submit(tool_fetch, {"url": u}): u for u in urls}
+        fn_map = {
+            "osint_handles": tool_osint_handles,
+            "osint_email": tool_osint_email,
+            "osint_domain": tool_osint_domain,
+            "osint_cnpj": tool_osint_cnpj,
+            "osint_phone": tool_osint_phone,
+        }
+        fut_recon = {}
+        for name, args in jobs:
+            fn = fn_map.get(name) or TOOLS.get(name)
+            if fn:
+                fut_recon[ex.submit(fn, args)] = name
+        all_futs: Dict[Any, str] = {f: u for f, u in fut_fetch.items()}
+        for f, n in fut_recon.items():
+            all_futs[f] = f"recon:{n}"
+        phase_total = len(all_futs)
+        phase_done = 0
+        try:
+            for fut in concurrent.futures.as_completed(all_futs, timeout=50):
+                tag = all_futs[fut]
+                try:
+                    res = fut.result(timeout=45)
+                except Exception as e:
+                    res = f"erro: {type(e).__name__}: {e}"
+                if tag.startswith("recon:"):
+                    recon_parts.append(f"=== {tag[6:]} ===\n{_clip(str(res), 2800)}")
+                else:
+                    fetch_blocks.append(f"[FETCH] {tag}\n{_clip(str(res), 1500)}")
+                phase_done += 1
+                if progress:
                     try:
-                        res = fut.result(timeout=45)
-                    except Exception as e:
-                        res = f"erro: {type(e).__name__}: {e}"
-                    fetch_blocks.append(f"[FETCH] {u}\n{_clip(str(res), 1800)}")
+                        progress("confirma", phase_done, phase_total, tag)
+                    except Exception:
+                        pass
+        except concurrent.futures.TimeoutError:
+            fetch_blocks.append("(tempo esgotado na fase 2: parcial)")
 
     parts = []
     if blocks:
-        parts.append("=== RESULTADOS DAS DORKS (rodadas pelo harness) ===\n" + "\n\n".join(blocks))
+        parts.append("=== RESULTADOS DAS BUSCAS (harness) ===\n" + "\n\n".join(blocks))
     if fetch_blocks:
         parts.append("=== PAGINAS ABERTAS (fetch automatico, dados crus) ===\n" + "\n\n".join(fetch_blocks))
-
-    try:
-        recon = osint_recon_target(user_text)
-    except Exception as e:
-        recon = f"(recon falhou: {type(e).__name__}: {e})"
-    if recon:
-        parts.append(recon)
-
+    if recon_parts:
+        parts.append("\n\n".join(recon_parts))
     return "\n\n".join(parts), dorks
 
 
@@ -934,15 +1098,20 @@ def tool_osint_dorks(args: Dict[str, Any]) -> str:
     try:
         limit = int(args.get("limit") or 10)
     except (TypeError, ValueError):
-        limit = 16
-    fetches = 3 if str(args.get("fetch", "sim")).lower() not in ("0", "nao", "não", "false") else 0
+        limit = 10
+    limit = min(max(limit, 1), 30)
+    fetches = 2 if str(args.get("fetch", "sim")).lower() not in ("0", "nao", "não", "false") else 0
+    progress = args.get("_progress") if callable(args.get("_progress")) else None
     try:
-        text, dorks = osint_autopilot(str(target), limit=min(max(limit, 1), 60), fetches=fetches)
+        text, dorks = osint_autopilot(str(target), limit=limit, fetches=fetches, progress=progress)
     except Exception as e:
         return f"erro osint_dorks: {type(e).__name__}: {e}"
     if not dorks:
         return "nenhuma dork gerada - informe um alvo (nome completo, email, dominio, @handle, telefone, CNPJ)"
-    head = f"osint_dorks rodou {len(dorks)} dorks:\n" + "\n".join(f"  {i}. {d}" for i, d in enumerate(dorks, 1))
+    head = (
+        f"osint_dorks: {len(dorks)} buscas executadas (+fetch+recon). "
+        "Resultados crus abaixo - confirme com fetch antes de afirmar qualquer dado:"
+    )
     return head + "\n\n" + text
 
 
@@ -1466,56 +1635,49 @@ def _render_dork(tpl: str, vals: Dict[str, str]) -> str:
 
 def osint_build_dorks(user_text: str, limit: int = 20, groups: Optional[List[str]] = None) -> List[str]:
     vals = _dork_values(user_text)
-    out: List[str] = []
     wanted = {g.lower() for g in groups} if groups else None
 
+    # passada unica: ja monta os baldes por grupo (antes renderizava tudo 2x)
+    per_group: List[List[str]] = []
+    seen: set = set()
     for g in DORK_GROUPS:
         if wanted and g["id"].lower() not in wanted and g["label"].lower() not in wanted:
             continue
         if not _NEEDS.get(g["when"], lambda v: False)(vals):
             continue
+        bucket: List[str] = []
         for tpl in g["dorks"]:
             d = _render_dork(tpl, vals)
-            if d and d not in out:
-                out.append(d)
+            if d and d.lower() not in seen:
+                seen.add(d.lower())
+                bucket.append(d)
+        if bucket:
+            per_group.append(bucket)
 
-    if not out:
+    if not per_group:
         key = vals["key"]
         if key:
             out = [f'"{key}"', f'"{key}" site:linkedin.com', f'"{key}" filetype:pdf']
-        return out[:limit]
+            return out[:limit] if limit else out
+        return []
 
-    if limit and len(out) > limit:
-        per_group: List[List[str]] = []
-        for g in DORK_GROUPS:
-            if wanted and g["id"].lower() not in wanted and g["label"].lower() not in wanted:
-                continue
-            if not _NEEDS.get(g["when"], lambda v: False)(vals):
-                continue
-            bucket = []
-            for tpl in g["dorks"]:
-                d = _render_dork(tpl, vals)
-                if d:
-                    bucket.append(d)
-            if bucket:
-                per_group.append(bucket)
-
-        picked: List[str] = []
-        idx = 0
-        while len(picked) < limit and per_group:
-            progressed = False
-            for bucket in per_group:
-                if idx < len(bucket) and len(picked) < limit:
-                    d = bucket[idx]
-                    if d not in picked:
-                        picked.append(d)
-                    progressed = True
-            if not progressed:
+    # round-robin entre grupos: cobre mais categorias com poucas buscas
+    picked: List[str] = []
+    idx = 0
+    while True:
+        if limit and len(picked) >= limit:
+            break
+        progressed = False
+        for bucket in per_group:
+            if limit and len(picked) >= limit:
                 break
-            idx += 1
-        out = picked or out[:limit]
-
-    return out[:limit] if limit else out
+            if idx < len(bucket):
+                picked.append(bucket[idx])
+                progressed = True
+        if not progressed:
+            break
+        idx += 1
+    return picked
 
 
 def dorks_by_group(user_text: str, limit_per_group: int = 3) -> List[Tuple[str, List[str]]]:
@@ -1539,19 +1701,73 @@ def dorks_by_group(user_text: str, limit_per_group: int = 3) -> List[Tuple[str, 
 _OSINT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36"
 
 
-def osint_http_text(url: str, timeout: float = 8.0, max_len: int = 8000) -> str:
+_OSINT_HTTP_CACHE: Dict[str, str] = {}
+_OSINT_HTTP_LOCK = threading.Lock()
+_OSINT_CLIENT: Optional[httpx.Client] = None
+
+
+def _osint_client() -> httpx.Client:
+    """Cliente HTTP compartilhado com pool de conexoes (bem mais rapido que httpx.get solto)."""
+    global _OSINT_CLIENT
+    if _OSINT_CLIENT is None:
+        with _OSINT_HTTP_LOCK:
+            if _OSINT_CLIENT is None:
+                _OSINT_CLIENT = httpx.Client(
+                    timeout=httpx.Timeout(12.0, connect=5.0),
+                    follow_redirects=True,
+                    headers={"User-Agent": _OSINT_UA, "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8"},
+                    limits=httpx.Limits(max_connections=40, max_keepalive_connections=20),
+                )
+    return _OSINT_CLIENT
+
+
+def osint_http_text(url: str, timeout: float = 6.0, max_len: int = 8000, use_cache: bool = True) -> str:
+    key = f"{url}|{max_len}"
+    if use_cache:
+        with _OSINT_HTTP_LOCK:
+            hit = _OSINT_HTTP_CACHE.get(key)
+        if hit is not None:
+            return hit
     try:
-        r = httpx.get(
-            url,
-            timeout=timeout,
-            follow_redirects=True,
-            headers={"User-Agent": _OSINT_UA, "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8"},
-        )
+        r = _osint_client().get(url, timeout=timeout)
         if r.status_code >= 400:
-            return f"HTTP {r.status_code}"
-        return _clean_html_to_text(r.text)[:max_len]
+            out = f"HTTP {r.status_code}"
+        else:
+            out = _clean_html_to_text(r.text)[:max_len]
     except Exception as e:
-        return f"erro {type(e).__name__}: {e}"
+        out = f"erro {type(e).__name__}: {e}"
+    if use_cache:
+        with _OSINT_HTTP_LOCK:
+            if len(_OSINT_HTTP_CACHE) < 600:
+                _OSINT_HTTP_CACHE[key] = out
+    return out
+
+
+def osint_http_many(
+    items: List[Tuple[str, str]],
+    timeout: float = 7.0,
+    max_len: int = 3000,
+    max_workers: int = 8,
+    overall_timeout: float = 50.0,
+) -> Dict[str, str]:
+    """Busca varias urls em paralelo com o cliente compartilhado. Retorna {nome: texto}."""
+    import concurrent.futures
+
+    results: Dict[str, str] = {}
+    if not items:
+        return results
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(max_workers, len(items)), thread_name_prefix="osinthttp"
+    ) as ex:
+        futs = {ex.submit(osint_http_text, url, timeout, max_len): name for name, url in items}
+        try:
+            for fut in concurrent.futures.as_completed(futs, timeout=overall_timeout):
+                results[futs[fut]] = fut.result()
+        except concurrent.futures.TimeoutError:
+            for fut, name in futs.items():
+                if name not in results:
+                    results[name] = "erro timeout"
+    return results
 
 
 def _looks_blocked(txt: str) -> bool:
@@ -1566,9 +1782,18 @@ def _looks_blocked(txt: str) -> bool:
     )
 
 
-def osint_search_one(query: str, engine: str = "auto", timeout: float = 7.0) -> str:
+_OSINT_SEARCH_CACHE: Dict[str, str] = {}
+
+
+def osint_search_one(query: str, engine: str = "auto", timeout: float = 5.0) -> str:
+    cache_key = f"{engine}|{query}"
+    with _OSINT_HTTP_LOCK:
+        hit = _OSINT_SEARCH_CACHE.get(cache_key)
+    if hit is not None:
+        return hit
     q = urllib.parse.quote(query)
-    engines = [engine] if engine != "auto" else ["mojeek", "bing", "ddg", "google"]
+    # google fora do auto: bloqueia bot em ~100% e desperdicava 1 tentativa inteira
+    engines = [engine] if engine != "auto" else ["bing", "mojeek", "ddg"]
     errors: List[str] = []
     for eng in engines:
         if eng == "mojeek":
@@ -1579,11 +1804,19 @@ def osint_search_one(query: str, engine: str = "auto", timeout: float = 7.0) -> 
             url = f"https://html.duckduckgo.com/html/?q={q}"
         else:
             url = f"https://www.google.com/search?q={q}&num=20&hl=pt-BR"
-        txt = osint_http_text(url, timeout=timeout, max_len=6000)
+        txt = osint_http_text(url, timeout=timeout, max_len=5000)
         if not _looks_blocked(txt):
-            return f"[{eng}] {txt}"
+            out = f"[{eng}] {txt}"
+            with _OSINT_HTTP_LOCK:
+                if len(_OSINT_SEARCH_CACHE) < 300:
+                    _OSINT_SEARCH_CACHE[cache_key] = out
+            return out
         errors.append(f"{eng}: {txt[:60] if txt else 'vazio'}")
-    return "[sem resultado] " + " | ".join(errors)[:300]
+    out = "[sem resultado] " + " | ".join(errors)[:300]
+    with _OSINT_HTTP_LOCK:
+        if len(_OSINT_SEARCH_CACHE) < 300:
+            _OSINT_SEARCH_CACHE[cache_key] = out
+    return out
 
 
 def tool_bing_search(args: Dict[str, Any]) -> str:
@@ -1650,12 +1883,9 @@ _NOT_FOUND_MARKERS = (
 )
 
 
-def _profile_exists(url: str, timeout: float = 7.0) -> Tuple[bool, str]:
+def _profile_exists(url: str, timeout: float = 5.0) -> Tuple[bool, str]:
     try:
-        r = httpx.get(
-            url, timeout=timeout, follow_redirects=True,
-            headers={"User-Agent": _OSINT_UA, "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8"},
-        )
+        r = _osint_client().get(url, timeout=timeout)
     except Exception as e:
         return False, f"erro {type(e).__name__}"
     if r.status_code == 404:
@@ -1678,28 +1908,33 @@ def tool_osint_handles(args: Dict[str, Any]) -> str:
     raw = str(args.get("handle") or args.get("username") or args.get("user") or "").strip()
     h = raw.lstrip("@").strip()
     if not h:
-        return "erro: mande handle (ex: {\"handle\":\"lolporfavor\"})"
+        return 'erro: mande handle (ex: {"handle":"lolporfavor"})'
 
     found: List[str] = []
     inconclusive: List[str] = []
-    missing: List[str] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10, thread_name_prefix="handle") as ex:
-        futs = {ex.submit(_profile_exists, url.format(h=urllib.parse.quote(h)), 6.0): (name, url.format(h=h))
+    missing = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16, thread_name_prefix="handle") as ex:
+        futs = {ex.submit(_profile_exists, url.format(h=urllib.parse.quote(h)), 5.0): (name, url.format(h=h))
                 for name, url, _ in PLATFORMS}
-        for fut in concurrent.futures.as_completed(futs, timeout=60):
-            name, url = futs[fut]
-            try:
-                ok, why = fut.result(timeout=30)
-            except Exception as e:
-                ok, why = False, f"erro {type(e).__name__}"
-            if ok and "pede login" in why:
-                inconclusive.append(f"{name}: {url} ({why})")
-            elif ok:
-                found.append(f"{name}: {url}")
-            else:
-                missing.append(f"{name} ({why})")
+        try:
+            for fut in concurrent.futures.as_completed(futs, timeout=45):
+                name, url = futs[fut]
+                try:
+                    ok, why = fut.result(timeout=20)
+                except Exception as e:
+                    ok, why = False, f"erro {type(e).__name__}"
+                if ok and "pede login" in why:
+                    inconclusive.append(f"{name}: {url} ({why})")
+                elif ok:
+                    found.append(f"{name}: {url}")
+                else:
+                    missing += 1
+        except concurrent.futures.TimeoutError:
+            pass
 
-    lines = [f"osint_handles '{h}': {len(found)} perfil(is) encontrado(s)"]
+    found.sort()
+    inconclusive.sort()
+    lines = [f"osint_handles '{h}': {len(found)} perfil(is) encontrado(s) em {len(PLATFORMS)} plataformas"]
     if found:
         lines.append("EXISTE:")
         lines += [f"  - {f}" for f in found]
@@ -1707,7 +1942,7 @@ def tool_osint_handles(args: Dict[str, Any]) -> str:
         lines.append("INCONCLUSIVO (pede login - confirme no navegador):")
         lines += [f"  - {f}" for f in inconclusive]
     if missing:
-        lines.append("NAO EXISTE: " + ", ".join(missing))
+        lines.append(f"NAO EXISTE em {missing} plataforma(s).")
     lines.append(
         "PROXIMO PASSO: para cada perfil que existe, rode o dork "
         f"'\"{h}\" site:<dominio>' pra pegar o conteudo indexado (bio, nome real, cidade, foto)."
@@ -1738,15 +1973,7 @@ def tool_osint_email(args: Dict[str, Any]) -> str:
     ]
 
     out: List[str] = [f"osint_email {email} (md5 {h})"]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=6, thread_name_prefix="email") as ex:
-        futs = {ex.submit(osint_http_text, url, 9.0, 2500): (name, url) for name, url in checks}
-        results: Dict[str, str] = {}
-        for fut in concurrent.futures.as_completed(futs, timeout=60):
-            name, url = futs[fut]
-            try:
-                results[name] = fut.result(timeout=30)
-            except Exception as e:
-                results[name] = f"erro {type(e).__name__}"
+    results = osint_http_many(checks, timeout=8.0, max_len=2500, max_workers=6, overall_timeout=45)
 
     for name, _ in checks:
         txt = results.get(name, "")
@@ -1813,15 +2040,7 @@ def tool_osint_domain(args: Dict[str, Any]) -> str:
     ]
 
     out: List[str] = [f"osint_domain {dom}"]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="domain") as ex:
-        futs = {ex.submit(osint_http_text, url, 12.0, 4000): (name, url) for name, url in urls}
-        results: Dict[str, str] = {}
-        for fut in concurrent.futures.as_completed(futs, timeout=75):
-            name, url = futs[fut]
-            try:
-                results[name] = fut.result(timeout=40)
-            except Exception as e:
-                results[name] = f"erro {type(e).__name__}"
+    results = osint_http_many(urls, timeout=9.0, max_len=3500, max_workers=8, overall_timeout=55)
 
     for name, _ in urls:
         txt = (results.get(name) or "").strip()
@@ -1863,9 +2082,9 @@ def tool_osint_cnpj(args: Dict[str, Any]) -> str:
     digits = re.sub(r"\D", "", raw)
     if len(digits) != 14:
         return "erro: mande CNPJ com 14 digitos"
-    txt = osint_http_text(f"https://brasilapi.com.br/api/cnpj/v1/{digits}", 12.0, 6000)
+    txt = osint_http_text(f"https://brasilapi.com.br/api/cnpj/v1/{digits}", 8.0, 5000)
     if txt.startswith("erro") or txt.startswith("HTTP 4"):
-        txt2 = osint_http_text(f"https://publica.cnpj.ws/cnpj/{digits}", 12.0, 6000)
+        txt2 = osint_http_text(f"https://publica.cnpj.ws/cnpj/{digits}", 8.0, 5000)
         if txt2.startswith("erro") or txt2.startswith("HTTP 4"):
             return f"erro ao consultar CNPJ {digits}: {txt} | {txt2}"
         txt = txt2
@@ -1992,6 +2211,7 @@ _BUCKET_TITLES = [
     ("processos", "processos judiciais / diarios"),
     ("registros", "registros publicos"),
     ("pessoais", "outros dados pessoais"),
+    ("outros", "links relacionados"),
 ]
 
 _NASC_RE = re.compile(
@@ -2038,9 +2258,9 @@ def _bucket_of(fact: Dict[str, Any]) -> str:
 
     if any(h in host for h in _HOST_REDES):
         return "redes"
-    if _PHONE_RE.search(dado):
+    if _PHONE_RE.search(dado) or _PHONE_RE.search(link):
         return "telefones"
-    if any(k in dado for k in _KEY_TELEFONE) and _PHONE_RE.search(dado):
+    if any(k in dado for k in _KEY_TELEFONE):
         return "telefones"
     if any(h in host for h in _HOST_PROCESSOS) or any(k in dado for k in _KEY_PROCESSO):
         return "processos"
@@ -2101,62 +2321,64 @@ def format_osint_report(
 
     buckets: Dict[str, List[Dict[str, str]]] = {k: [] for k, _ in _BUCKET_TITLES}
     vistos: set = set()
-
     for a in (achados or []):
         fact: Dict[str, Any] = a if isinstance(a, dict) else {"dado": str(a)}
         link = str(fact.get("link") or fact.get("url") or "").strip()
+        conf = str(fact.get("confianca") or "").strip().lower()
         key = (link or str(fact.get("dado") or "")).lower()
         if not key or key in vistos:
             continue
         vistos.add(key)
         b = _bucket_of(fact)
-        if b == "outros":
-            continue
-        buckets[b].append({
+        buckets.setdefault(b, []).append({
             "dado": _clean_dado(str(fact.get("dado") or ""), link),
             "link": link,
+            "confianca": conf,
         })
 
+    total = sum(len(v) for v in buckets.values())
+    fontes_n = len({it["link"] for v in buckets.values() for it in v if it["link"]})
+    quando = datetime.datetime.now().strftime("%d/%m/%Y %H:%M")
+
     linhas: List[str] = []
-    linhas.append(f"Alvo Em que Voce Me deu: {alvo or 'NAO INFORMADO'}")
+    linhas.append(f"Alvo: {alvo or 'NAO INFORMADO'}")
+    linhas.append(f"Nome real: {_nao_conf(nome_real)} | Nascimento: {_nao_conf(nascimento)} | Local: {local}")
+    linhas.append(f"{total} achado(s) em {fontes_n} fonte(s) - gerado em {quando}")
     linhas.append("")
-    linhas.append("Relatorio:")
-    linhas.append("")
-    linhas.append(
-        f"{_nao_conf(nome_real)} Nascido no ano de {_nao_conf(nascimento)} "
-        f"na localidade de {local}, resto das informaçoes colhidas:"
-    )
 
     mostrou = False
     for key, titulo in _BUCKET_TITLES:
-        itens = buckets[key]
+        itens = buckets.get(key) or []
         if not itens:
             continue
-        linhas.append(f"- {titulo}:")
-        for it in itens[:12]:
-            linha = it["dado"]
+        linhas.append(f"{titulo.upper()} ({len(itens)})")
+        for i, it in enumerate(itens[:12], 1):
+            linha = f"  {i}. {it['dado']}"
             if it["link"]:
                 linha += f" | {it['link']}"
-            linhas.append(f"  * {linha}")
+            if it["confianca"] and it["confianca"] not in ("media", "média"):
+                linha += f" [{it['confianca']}]"
+            linhas.append(linha)
         mostrou = True
 
     if not mostrou:
-        linhas.append("- nada confirmado nas buscas (sem link verificavel)")
+        linhas.append("Nada confirmado nas buscas (sem link verificavel).")
 
     inf = [str(i).strip() for i in (inferencias or []) if str(i).strip()]
     if inf:
-        linhas.append("- inferencias (nao confirmado):")
-        linhas += [f"  * {_clip(x, 120)}" for x in inf[:4]]
+        linhas.append("")
+        linhas.append("INFERENCIAS (nao confirmado):")
+        linhas += [f"  - {_clip(x, 130)}" for x in inf[:5]]
 
     nf = [str(i).strip() for i in (nao_encontrado or []) if str(i).strip()]
     if nf:
-        linhas.append("- sem resultado em: " + ", ".join(_clip(x, 40) for x in nf[:6]))
+        linhas.append("SEM RESULTADO EM: " + ", ".join(_clip(x, 40) for x in nf[:8]))
 
     if resumo and not mostrou:
         frase = re.split(r"(?<=[.!?])\s", " ".join(str(resumo).split()))[0]
         frase = _clip(frase, 160)
         if frase and not any(frase[:40] in l for l in linhas):
-            linhas.append(f"- obs: {frase}")
+            linhas.append(f"OBS: {frase}")
 
     return "\n".join(linhas)
 
@@ -2306,8 +2528,12 @@ def tool_osint_report(args: Dict[str, Any]) -> str:
     if str(args.get("salvar", "sim")).lower() not in ("0", "nao", "não", "false"):
         try:
             path = safe_path(f"osint_{_slug(alvo)}.md")
-            header = f"# Relatorio OSINT - {alvo}\n\n" + datetime.datetime.now().strftime("Gerado em %d/%m/%Y %H:%M\n\n")
-            path.write_text(header + relatorio + "\n", encoding="utf-8")
+            header = (
+                f"# Relatorio OSINT - {alvo}\n\n"
+                + datetime.datetime.now().strftime("Gerado em %d/%m/%Y %H:%M\n\n")
+                + "> Fonte aberta e publica. Confira cada link antes de usar o dado.\n\n```text\n"
+            )
+            path.write_text(header + relatorio + "\n```\n", encoding="utf-8")
             salvo = str(path.name)
         except Exception as e:
             salvo = f"(falha ao salvar: {e})"
@@ -2796,7 +3022,7 @@ _OSINT_FILLER_RE = re.compile(
 )
 
 
-def osint_visible_text(text: str, max_linhas: int = 3, max_chars: int = 400) -> str:
+def osint_visible_text(text: str, max_linhas: int = 5, max_chars: int = 600) -> str:
     keep: List[str] = []
     for raw_line in strip_dorks(text).splitlines():
         s = raw_line.strip()
@@ -2808,8 +3034,14 @@ def osint_visible_text(text: str, max_linhas: int = 3, max_chars: int = 400) -> 
             continue
         if "|" in s and "http" in s:
             continue
-        if s.startswith(("-", "*", "\u2022")):
+        if _DORK_OPERATOR_RE.search(s):
             continue
+        if s.startswith(("-", "*", "\u2022")):
+            # bullets curtos sem link sao resumo util - mantem sem o marcador
+            corpo = s.lstrip("-*\u2022 ").strip()
+            if not corpo or "http" in corpo or len(corpo) > 160:
+                continue
+            s = corpo
         if _OSINT_FILLER_RE.search(s):
             continue
         keep.append(s)
@@ -2860,6 +3092,12 @@ def exec_tools(text: str) -> Tuple[str, List[str], List[str]]:
             args = call.get("args", {}) or {}
             if name not in TOOLS:
                 return f"tool desconhecida: {name}", f"used {name}..."
+            if name in ("osint_dorks", "dorks", "osint", "osint_handles", "osint_email",
+                        "osint_domain", "osint_cnpj", "osint_phone"):
+                _tgt = (args.get("target") or args.get("handle") or args.get("email")
+                        or args.get("domain") or args.get("cnpj") or args.get("phone")
+                        or args.get("query") or "")
+                print(f"  {SYM['search']} {Colors.cyan('investigando...')} {Colors.gray(_clip(_tgt, 50))}")
             try:
                 res = TOOLS[name](args)
             except Exception as e:
@@ -2869,7 +3107,13 @@ def exec_tools(text: str) -> Tuple[str, List[str], List[str]]:
             q = args.get("query") or args.get("url") or args.get("path") or args.get("from") or args.get("command") or ""
             q = str(q)[:60]
             if name in ("osint_dorks", "dorks", "osint"):
-                used_msg = f"fetched dorks: {q}..." if q else "fetched dorks..."
+                used_msg = f"{SYM['search']} buscas: {_clip(q, 45)}..." if q else f"{SYM['search']} buscas..."
+            elif name in ("osint_handles", "osint_email", "osint_domain", "osint_cnpj", "osint_phone"):
+                alvo_q = (args.get("handle") or args.get("email") or args.get("domain")
+                          or args.get("cnpj") or args.get("phone") or args.get("target") or q or "?")
+                used_msg = f"{SYM['bullet']} {str(name).replace('osint_', '')}: {_clip(alvo_q, 45)}"
+            elif name in ("osint_report", "relatorio"):
+                used_msg = f"{SYM['ok']} relatorio gerado"
             elif name in ("shell", "powershell", "bash", "terminal", "cmd", "run"):
                 used_msg = f"$ {q}" if q else ""
             elif name in ("grep", "grep_search", "code_search", "search_code", "fetch", "web_fetch", "fetch_page", "web_search", "search", "google", "google_github", "github_google", "google_search", "gsearch", "google_fetch", "site_search", "google_site", "google_site_search", "site_github_search", "github_search"):
@@ -2885,16 +3129,20 @@ def exec_tools(text: str) -> Tuple[str, List[str], List[str]]:
     if not calls:
         return clean_output(strip_tool_markup(text)), results, used
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5, thread_name_prefix="tool") as executor:
+    # osint_dorks roda ~10 buscas + fetch + recon: teto maior (antes caia em 75s sempre)
+    _TOOL_TIMEOUTS = {"osint_dorks": 150, "dorks": 150, "osint": 150,
+                      "osint_domain": 100, "osint_email": 100, "osint_handles": 100}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6, thread_name_prefix="tool") as executor:
         futures = [executor.submit(run_one, call) for call in calls]
         for idx, future in enumerate(futures):
             call = calls[idx]
+            _tmo = _TOOL_TIMEOUTS.get(str(call.get("name") or ""), 75)
             try:
-                res, used_msg = future.result(timeout=75)
+                res, used_msg = future.result(timeout=_tmo)
                 results.append(res)
                 used.append(used_msg)
             except concurrent.futures.TimeoutError:
-                results.append(f"erro timeout: tool {call.get('name')} travou apos 75s e foi abortada")
+                results.append(f"erro timeout: tool {call.get('name')} travou apos {_tmo}s e foi abortada")
                 used.append(f"used {call.get('name')} timeout...")
             except Exception as e:
                 results.append(f"erro thread: {e}")
@@ -3511,10 +3759,11 @@ ENTRADA:
 - Nunca pergunte "quer que eu busque?" - busque.
 
 METODO OBRIGATORIO (sempre nessa ordem):
-1. PRIMEIRO PASSO, SEMPRE: chame a tool osint_dorks uma vez com o alvo completo.
-   Ex: <<<TOOL_CALL>>>{"name":"osint_dorks","args":{"target":"GUILHERME DONATANGELO"}}<<<END_TOOL>>>
-   Ela roda a bateria de dorks (linkedin, github, pdf, jusbrasil, paste, handles...) e ja abre as paginas mais promissoras.
-   Se voce responder sem nenhuma tool call, a resposta e considerada FALHA.
+1. O harness JA roda uma pre-busca automatica antes de te chamar (bloco [PRE-BUSCA AUTOMATICA]).
+   Comece ANALISANDO esses resultados - NAO repita osint_dorks com o mesmo alvo.
+   So chame osint_dorks de novo para um alvo DIFERENTE (ex: outro nome/handle achado no caminho).
+   Ex: <<<TOOL_CALL>>>{"name":"osint_dorks","args":{"target":"outro alvo aqui"}}<<<END_TOOL>>>
+   Se voce responder sem nenhuma tool call E sem chamar osint_report, a resposta e considerada FALHA.
 2. Depois LEIA o que voltou, e rode VOCE mais 3-5 buscas especificas que faltaram (google_search / site_search / web_search / grep).
 3. CONFIRMAR com fetch nas paginas que importam (perfil publico, registro, PDF, noticia, github, forum, paste).
 4. CORRELACIONAR: cruze as pistas (mesmo e-mail em 2 fontes, mesmo handle em 2 sites, mesmo telefone, mesma empresa).
@@ -3563,11 +3812,11 @@ TOOLS QUE VOCE USA:
 - write_file / read_file / edit_file: salvar relatorio no workspace
 - shell: comandos locais (whois, dig, openssl) quando ajudar
 
-- osint_dorks: {"target":"alvo"} -> roda a bateria de dorks e ja abre as paginas (USE PRIMEIRO, sempre)
+- osint_dorks: {"target":"alvo"} -> ~10 buscas + fetch + recon (o harness ja roda 1x sozinho; use para alvos novos)
 - google_search / site_search / web_search / grep / fetch: buscas e confirmacao finas
 
 TOOLS DE FECHAMENTO DE CERCO (use todas que couberem):
-- osint_dorks      {"target":"alvo"}                  -> 226 dorks em 22 categorias (identidade, social, docs, juridico, governo, empresa, academico, codigo, pastes, foruns, infra, email, handle, telefone, cnpj, midia, local, esporte, imagem, correlacao)
+- osint_dorks      {"target":"alvo"}                  -> ~10 buscas paralelas + abre paginas + recon (handles/e-mail/dominio/cnpj/telefone). O harness ja roda 1x sozinho; use para alvos NOVOS
 - osint_handles    {"handle":"nick"}                  -> testa o nick em ~32 plataformas
 - osint_email      {"email":"x@y.com"}                -> gravatar (md5), commits do github com esse e-mail, perfil, keybase, indices
 - osint_domain     {"domain":"x.com.br"}              -> crt.sh (subdominios), wayback, DNS, headers, robots/sitemap, security.txt
@@ -3579,14 +3828,19 @@ TOOLS DE FECHAMENTO DE CERCO (use todas que couberem):
 
 RELATORIO FINAL (OBRIGATORIO) - chame a tool osint_report no fim:
 <<<TOOL_CALL>>>{"name":"osint_report","args":{"alvo":"o nome que o usuario deu","nome_real":"...","nascimento":"1990","pais":"Brasil","estado":"CE","cidade":"Fortaleza","achados":[{"dado":"perfil no instagram","link":"https://instagram.com/x"},{"dado":"telefone (85) 99999-9999","link":"https://..."},{"dado":"processo 0001234-56.2020 (vara civil)","link":"https://jusbrasil..."}],"inferencias":["..."],"nao_encontrado":["..."]}}<<<END_TOOL>>>
-Ela imprime e salva workspace/osint_<alvo>.md exatamente neste padrao:
+Ela imprime na tela e salva workspace/osint_<alvo>.md exatamente neste padrao:
 
-Alvo Em que Voce Me deu: {o que o usuario mandou}
+Alvo: {o que o usuario mandou}
+Nome real: {nome} | Nascimento: {ano} | Local: {pais, estado, cidade}
+{total} achado(s) em {n} fonte(s) - gerado em {data}
 
-Relatorio:
-
-{nome real do alvo} Nascido no ano de {ano de nascimento} na localidade de {pais, estado, cidade}, resto das informaçoes colhidas:
-- dados confirmados (com link)
+REDES SOCIAIS (n)
+  1. {dado curto} | {link}
+TELEFONES (n)
+  1. {dado curto} | {link}
+PROCESSOS JUDICIAIS / DIARIOS (n)
+  1. {dado curto} | {link}
+... (mesmo padrao para registros, dados pessoais e links relacionados)
 
 O QUE O USUARIO QUER SABER (e so isso):
 1. NOME REAL (e apelidos/nomes usados)
@@ -3604,7 +3858,7 @@ REGRAS DO RELATORIO:
 - Cada "dado" curto e objetivo: "perfil no instagram", "telefone (85) 9xxxx-xxxx", "processo 0001234-56.2020 - TJCE".
 
 FORMATO DA SUA RESPOSTA NA TELA (o que o usuario le):
-- No maximo 3 linhas de texto. Sem lista de dorks, sem "**", sem explicar metodo, sem historico de busca.
+- No maximo 5 linhas de texto. Sem lista de dorks, sem "**", sem explicar metodo, sem historico de busca.
 - Nunca escreva a palavra "dork" na resposta ao usuario.
 - Depois do texto, chame osint_report (ela imprime o relatorio limpo).
 - Nada de repetir o que ja esta no relatorio.
@@ -3648,6 +3902,88 @@ AGENTS: Dict[str, Dict[str, str]] = {
 def _box_line(text: str) -> str:
     plain = len(re.sub(r"\x1b\[[0-9;]*m", "", text))
     return f"{SYM['box_v']}{text}{' ' * max(0, 52 - plain)}{SYM['box_v']}"
+
+
+# ---------------------------------------------------------------------------
+# OSINT - apresentacao no chat
+# ---------------------------------------------------------------------------
+
+def _progress_bar(done: int, total: int, width: int = 18) -> str:
+    total = max(1, total)
+    fill = min(width, int(width * done / total))
+    return SYM["bar_full"] * fill + SYM["bar_empty"] * (width - fill)
+
+
+def print_osint_banner(target: str) -> None:
+    alvo = _clip(" ".join(str(target or "").split()), 60)
+    print(f"\n  {SYM['search']} {Colors.bold(Colors.cyan('OSINT'))} {Colors.gray('alvo:')} {Colors.white(alvo)}")
+
+
+def print_osint_progress(stage: str, done: int, total: int, detail: str = "") -> None:
+    nomes = {"dorks": "buscando fontes", "confirma": "abrindo paginas + recon", "recon": "recon"}
+    rotulo = nomes.get(stage, stage)
+    det = _clip(" ".join(str(detail or "").split()), 42)
+    bar = _progress_bar(done, total)
+    line = f"  {SYM['search']} {Colors.cyan(rotulo)} [{bar}] {done}/{total}"
+    if det:
+        line += f" {Colors.gray(det)}"
+    sys.stdout.write("\r" + line + " " * 6)
+    sys.stdout.flush()
+    if done >= total:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+
+def print_osint_agent_text(text: str) -> None:
+    t = str(text or "").strip()
+    if not t:
+        return
+    print()
+    for ln in t.splitlines() or [t]:
+        print(f"  {Colors.cyan(SYM['box_v'])} {ln}")
+    print()
+
+
+_SECTION_OSINT_RE = re.compile(r"^([A-Z\u00c0-\u00dd ]{4,}(?:\s*\(\d+\))?)\s*$")
+
+
+def print_osint_report(text: str) -> None:
+    """Imprime o relatorio OSINT com cores por secao (o texto original vai pro arquivo)."""
+    t = str(text or "")
+    if not t.strip():
+        return
+    rule = "\u2501" * 52 if USE_UNICODE else "-" * 52
+    print()
+    print(f"  {Colors.bold(Colors.cyan(rule))}")
+    for ln in t.splitlines():
+        s = ln.rstrip()
+        if not s.strip():
+            print()
+            continue
+        low = s.strip().lower()
+        if s.startswith("Alvo:"):
+            print(f"  {Colors.bold(Colors.white(s))}")
+        elif s.startswith("Nome real:"):
+            print(f"  {Colors.gray(s)}")
+        elif "achado(s) em" in s and "fonte(s)" in s:
+            print(f"  {Colors.green(SYM['ok'] + ' ' + s.strip())}")
+        elif _SECTION_OSINT_RE.match(s.strip()):
+            print(f"\n  {Colors.bold(Colors.cyan(s.strip()))}")
+        elif low.startswith(("inferencias", "sem resultado", "obs:", "nada confirmado")):
+            print(f"  {Colors.yellow(s)}")
+        elif re.match(r"^\s*\d+\.\s", s):
+            if " | http" in s:
+                dado, _, link = s.partition(" | http")
+                link = "http" + link
+                print(f"  {Colors.white(dado.strip())} {Colors.gray('|')} {Colors.cyan(_clip(link, 80))}")
+            else:
+                print(f"  {s}")
+        elif s.strip().startswith("(salvo em"):
+            print(f"  {Colors.gray(s.strip())}")
+        else:
+            print(f"  {s}")
+    print(f"  {Colors.bold(Colors.cyan(rule))}")
+    print()
 
 
 def print_header(agents: Optional["AgentManager"] = None):
@@ -4468,6 +4804,25 @@ def main():
 
             print(f"  {Colors.gray(SYM['corner'] + ' Press Enter to stop')}")
 
+            # OSINT: pre-busca automatica antes do LLM (economiza 1 turno inteiro)
+            pre_osint_text = ""
+            if agents.current == "osint" and _looks_like_osint_target(q):
+                try:
+                    print_osint_banner(q)
+                    pre_osint_text, _pre_dorks = osint_autopilot(
+                        q, limit=10, fetches=2, progress=print_osint_progress
+                    )
+                    auto_dorks = list(_pre_dorks)
+                    if pre_osint_text:
+                        prompt += (
+                            "\n\n[PRE-BUSCA AUTOMATICA - dados crus do harness, "
+                            "confira com fetch antes de afirmar]\n"
+                            + pre_osint_text[:12000]
+                            + "\n[FIM DA PRE-BUSCA]\n"
+                        )
+                except Exception as e:
+                    print(f"  {Colors.gray(f'(pre-busca falhou: {type(e).__name__})')}")
+
             for loop in range(15):
                 buf: List[str] = []
                 continuations = 0
@@ -4564,9 +4919,19 @@ def main():
                     if agents.current == "osint":
                         visivel = osint_visible_text(clean)
                         if visivel:
-                            print(f"\n{visivel}\n")
+                            print_osint_agent_text(visivel)
                     else:
                         print(f"\n{clean}\n")
+
+                # OSINT: o modelo gerou o relatorio? mostra na hora, colorido
+                # (antes o relatorio ia so pro proximo prompt e nunca aparecia na tela)
+                try:
+                    for (_s, _e, _c), _res in zip(extract_tool_calls(raw), results):
+                        if str(_c.get("name", "")) in ("osint_report", "relatorio"):
+                            if _res and not str(_res).startswith("erro"):
+                                print_osint_report(_res)
+                except Exception:
+                    pass
 
                 auto_workflow_results = []
                 try:
@@ -4600,18 +4965,23 @@ def main():
                     results.append(f"erro auto workflow: {e}")
 
                 auto_osint_text = ""
-                if not used and agents.current == "osint" and loop == 0:
-                    auto_osint_text, auto_dorks = osint_autopilot(q)
-                    if auto_dorks:
-                        print(f"  {SYM['bullet']} buscando {len(auto_dorks)} fontes + recon...")
+                if not used and agents.current == "osint" and loop == 0 and not pre_osint_text:
+                    # fallback: sem pre-busca e o modelo nao chamou tools - busca agora
+                    print(f"  {SYM['search']} {Colors.cyan('busca automatica...')}")
+                    auto_osint_text, _auto_d = osint_autopilot(
+                        q, limit=8, fetches=2, progress=print_osint_progress
+                    )
+                    auto_dorks = list(_auto_d)
+                    if _auto_d:
                         results.append(auto_osint_text)
                         used.append("")
 
                 if not used and agents.current == "osint" and not report_done:
+                    _base_ev = auto_osint_text or pre_osint_text
                     if resumo_buf:
-                        evidencias = "\n".join(resumo_buf) + "\n" + auto_osint_text
-                    elif auto_osint_text:
-                        evidencias = auto_osint_text
+                        evidencias = "\n".join(resumo_buf) + "\n" + _base_ev
+                    elif _base_ev:
+                        evidencias = _base_ev
                     else:
                         evidencias = clean
 
@@ -4634,8 +5004,7 @@ def main():
                         "confianca": dossier.get("confianca", ""),
                         "resumo": (clean or "achados abaixo")[:400],
                     })
-                    print()
-                    print(auto_rel)
+                    print_osint_report(auto_rel)
                     report_done = True
 
                 if not used:
@@ -4674,10 +5043,11 @@ def main():
 
             diff_tracker.print_pending()
             elapsed = time.time() - start_time
+            _extra = f" - {len(auto_dorks)} buscas" if agents.current == "osint" and auto_dorks else ""
             if interrupted:
-                print(f"\n  {SYM['claude_dot']} {Colors.gray(f'Stopped - {elapsed:.1f}s')}")
+                print(f"\n  {SYM['claude_dot']} {Colors.gray(f'Stopped - {elapsed:.1f}s{_extra}')}")
             else:
-                print(f"\n  {SYM['claude_dot']} {Colors.gray(f'{elapsed:.1f}s')}")
+                print(f"\n  {SYM['claude_dot']} {Colors.gray(f'{elapsed:.1f}s{_extra}')}")
 
     finally:
         try:
