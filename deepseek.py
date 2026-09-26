@@ -431,12 +431,7 @@ class DiffTracker:
         return out
 
     def print_pending(self) -> int:
-        entries = self.snapshot()
-        for entry in entries:
-            print()
-            for line in self.render(entry):
-                print(line)
-        return len(entries)
+        return len(self.snapshot())
 
     def show_and_clear(self) -> None:
         self.print_pending()
@@ -990,18 +985,14 @@ def osint_autopilot(
     fetches: int = 2,
     progress: Optional[Callable] = None,
 ) -> Tuple[str, List[str]]:
-    """Bateria automatica: dorks em paralelo, depois fetch+recon em paralelo.
-
-    Orcamento total ~95s no pior caso (antes passava de 300s e caia no timeout
-    de 75s do exec_tools). Na pratica roda em 15-40s.
-    """
+    """Bateria automatica: dorks em paralelo, depois fetch+recon em paralelo."""
     import concurrent.futures
 
     dorks = osint_build_dorks(user_text, limit)
     if not dorks:
         return "", []
 
-    # FASE 1 - dorks em paralelo (busca direta, sem lookup em TOOLS)
+    # FASE 1 - dorks em paralelo
     blocks: List[str] = []
     total = len(dorks)
     done = 0
@@ -1026,7 +1017,7 @@ def osint_autopilot(
         except concurrent.futures.TimeoutError:
             blocks.append("(tempo esgotado nas buscas: resultados parciais)")
 
-    # FASE 2 - fetch das melhores urls + recon, tudo junto em paralelo
+    # FASE 2 - fetch + recon
     urls: List[str] = []
     for b in blocks:
         for u in _URL_RE.findall(b):
@@ -1637,7 +1628,6 @@ def osint_build_dorks(user_text: str, limit: int = 20, groups: Optional[List[str
     vals = _dork_values(user_text)
     wanted = {g.lower() for g in groups} if groups else None
 
-    # passada unica: ja monta os baldes por grupo (antes renderizava tudo 2x)
     per_group: List[List[str]] = []
     seen: set = set()
     for g in DORK_GROUPS:
@@ -1661,7 +1651,6 @@ def osint_build_dorks(user_text: str, limit: int = 20, groups: Optional[List[str
             return out[:limit] if limit else out
         return []
 
-    # round-robin entre grupos: cobre mais categorias com poucas buscas
     picked: List[str] = []
     idx = 0
     while True:
@@ -1792,7 +1781,6 @@ def osint_search_one(query: str, engine: str = "auto", timeout: float = 5.0) -> 
     if hit is not None:
         return hit
     q = urllib.parse.quote(query)
-    # google fora do auto: bloqueia bot em ~100% e desperdicava 1 tentativa inteira
     engines = [engine] if engine != "auto" else ["bing", "mojeek", "ddg"]
     errors: List[str] = []
     for eng in engines:
@@ -2847,7 +2835,7 @@ def _scan_json_end(text: str, start: int) -> int:
         else:
             if c == '"':
                 in_str = True
-            elif c in "{[":
+            elif c in "{[": 
                 depth += 1
             elif c in "}]":
                 depth -= 1
@@ -3037,7 +3025,6 @@ def osint_visible_text(text: str, max_linhas: int = 5, max_chars: int = 600) -> 
         if _DORK_OPERATOR_RE.search(s):
             continue
         if s.startswith(("-", "*", "\u2022")):
-            # bullets curtos sem link sao resumo util - mantem sem o marcador
             corpo = s.lstrip("-*\u2022 ").strip()
             if not corpo or "http" in corpo or len(corpo) > 160:
                 continue
@@ -3092,12 +3079,6 @@ def exec_tools(text: str) -> Tuple[str, List[str], List[str]]:
             args = call.get("args", {}) or {}
             if name not in TOOLS:
                 return f"tool desconhecida: {name}", f"used {name}..."
-            if name in ("osint_dorks", "dorks", "osint", "osint_handles", "osint_email",
-                        "osint_domain", "osint_cnpj", "osint_phone"):
-                _tgt = (args.get("target") or args.get("handle") or args.get("email")
-                        or args.get("domain") or args.get("cnpj") or args.get("phone")
-                        or args.get("query") or "")
-                print(f"  {SYM['search']} {Colors.cyan('investigando...')} {Colors.gray(_clip(_tgt, 50))}")
             try:
                 res = TOOLS[name](args)
             except Exception as e:
@@ -3129,7 +3110,6 @@ def exec_tools(text: str) -> Tuple[str, List[str], List[str]]:
     if not calls:
         return clean_output(strip_tool_markup(text)), results, used
 
-    # osint_dorks roda ~10 buscas + fetch + recon: teto maior (antes caia em 75s sempre)
     _TOOL_TIMEOUTS = {"osint_dorks": 150, "dorks": 150, "osint": 150,
                       "osint_domain": 100, "osint_email": 100, "osint_handles": 100}
     with concurrent.futures.ThreadPoolExecutor(max_workers=6, thread_name_prefix="tool") as executor:
@@ -3628,32 +3608,6 @@ class DeepSeekClient:
             pass
 
 
-DH_ART = r"""
-                **gggrgM**M#mggg**
-                **wgNN@"B*P""mp""@d#"@N#Nw**
-              *g#@0F*a*F#  **F9m* ,F9*__9NG#g_
-           *mN#F  aM"    #p"    !q@    9NL "9#Qu*
-          g#MF *pP"L*  g@"9L_  *g""#*_  g"9w_ 0N#p
-        *0F jL*"   7*wF     #_gF     9gjF   "bJ  9h_
-       j#  gAF    *@NL*     g@#_      J@u_    2#_  #_
-      ,FF_#" 9_ *#"  "b*  g@   "hg  *#"  !q* jF "*_09_
-      F N"    #p"      Ng@       `#g"      "w@    "# t
-     j p#    g"9_     g@"9_      gP"#_     gF"q    Pb L
-     0J  k *@   9g* j#"   "b_  j#"   "b_ *d"   q* g  ##
-     #F  `NF     "#g"       "Md"       5N#      9W"  j#
-     #k  jFb_    g@"q_     _*"9m_     _*"R_    _#Np  J#
-     tApjF  9g  J"   9M_ _m"    9%_ **"   "#  gF  9*jNF
-      k`N    "q#       9g@        #gF       ##"    #"j
-      `_0q_   #"q_    _&"9p_    _g"`L_    _*"#   jAF,'
-       9# "b_j   "b_ g"    *g gF    9 g#"  "L_*"qNF
-        "b_ "#_    "NL      *B#*      I@     j#" _#"
-          NM_0"*g_ j""9u_  gP  q_  _w@ ]_ *g*"F*g@
-           "NNh_ !w#_   9#g"    "m*"   *#*"* dN@"
-              9##g_0@q__ #"4_  j*"k __*NF_g#@P"
-                "9NN#gIPNL_ "b@" _2M"Lg#N@F"
-                    ""P@*NN#gEZgNN@#@P""
-"""
-
 KERNEL11_PROMPT = """Voce e kernel11-chat, agente autonomo estilo Claude Code. Criado por Kernel11. Voce e 100% AUTONOMO com PERSISTENCIA.
 
 IDENTIDADE:
@@ -3899,119 +3853,51 @@ AGENTS: Dict[str, Dict[str, str]] = {
 }
 
 
-def _box_line(text: str) -> str:
-    plain = len(re.sub(r"\x1b\[[0-9;]*m", "", text))
-    return f"{SYM['box_v']}{text}{' ' * max(0, 52 - plain)}{SYM['box_v']}"
-
-
 # ---------------------------------------------------------------------------
-# OSINT - apresentacao no chat
+# Apresentacao no chat (minima: apenas Agent Mode, chat e ANSI)
 # ---------------------------------------------------------------------------
 
 def _progress_bar(done: int, total: int, width: int = 18) -> str:
-    total = max(1, total)
-    fill = min(width, int(width * done / total))
-    return SYM["bar_full"] * fill + SYM["bar_empty"] * (width - fill)
+    return ""
 
 
 def print_osint_banner(target: str) -> None:
-    alvo = _clip(" ".join(str(target or "").split()), 60)
-    print(f"\n  {SYM['search']} {Colors.bold(Colors.cyan('OSINT'))} {Colors.gray('alvo:')} {Colors.white(alvo)}")
+    return
 
 
 def print_osint_progress(stage: str, done: int, total: int, detail: str = "") -> None:
-    nomes = {"dorks": "buscando fontes", "confirma": "abrindo paginas + recon", "recon": "recon"}
-    rotulo = nomes.get(stage, stage)
-    det = _clip(" ".join(str(detail or "").split()), 42)
-    bar = _progress_bar(done, total)
-    line = f"  {SYM['search']} {Colors.cyan(rotulo)} [{bar}] {done}/{total}"
-    if det:
-        line += f" {Colors.gray(det)}"
-    sys.stdout.write("\r" + line + " " * 6)
-    sys.stdout.flush()
-    if done >= total:
-        sys.stdout.write("\n")
-        sys.stdout.flush()
+    return
 
 
 def print_osint_agent_text(text: str) -> None:
     t = str(text or "").strip()
-    if not t:
-        return
-    print()
-    for ln in t.splitlines() or [t]:
-        print(f"  {Colors.cyan(SYM['box_v'])} {ln}")
-    print()
-
-
-_SECTION_OSINT_RE = re.compile(r"^([A-Z\u00c0-\u00dd ]{4,}(?:\s*\(\d+\))?)\s*$")
+    if t:
+        print(t)
 
 
 def print_osint_report(text: str) -> None:
-    """Imprime o relatorio OSINT com cores por secao (o texto original vai pro arquivo)."""
-    t = str(text or "")
-    if not t.strip():
-        return
-    rule = "\u2501" * 52 if USE_UNICODE else "-" * 52
-    print()
-    print(f"  {Colors.bold(Colors.cyan(rule))}")
-    for ln in t.splitlines():
-        s = ln.rstrip()
-        if not s.strip():
-            print()
-            continue
-        low = s.strip().lower()
-        if s.startswith("Alvo:"):
-            print(f"  {Colors.bold(Colors.white(s))}")
-        elif s.startswith("Nome real:"):
-            print(f"  {Colors.gray(s)}")
-        elif "achado(s) em" in s and "fonte(s)" in s:
-            print(f"  {Colors.green(SYM['ok'] + ' ' + s.strip())}")
-        elif _SECTION_OSINT_RE.match(s.strip()):
-            print(f"\n  {Colors.bold(Colors.cyan(s.strip()))}")
-        elif low.startswith(("inferencias", "sem resultado", "obs:", "nada confirmado")):
-            print(f"  {Colors.yellow(s)}")
-        elif re.match(r"^\s*\d+\.\s", s):
-            if " | http" in s:
-                dado, _, link = s.partition(" | http")
-                link = "http" + link
-                print(f"  {Colors.white(dado.strip())} {Colors.gray('|')} {Colors.cyan(_clip(link, 80))}")
-            else:
-                print(f"  {s}")
-        elif s.strip().startswith("(salvo em"):
-            print(f"  {Colors.gray(s.strip())}")
-        else:
-            print(f"  {s}")
-    print(f"  {Colors.bold(Colors.cyan(rule))}")
-    print()
+    t = str(text or "").strip()
+    if t:
+        print(t)
 
 
 def print_header(agents: Optional["AgentManager"] = None):
-    art = DH_ART.strip("\n")
-    for line in art.splitlines():
-        print(line)
-
-    who = f"agente {agents.label()} ({agents.current})" if agents else "Autonomous chat"
-    print(f"{SYM['box_tl']}{SYM['box_h'] * 52}{SYM['box_tr']}")
-    print(_box_line(f"  {SYM['star']} {Colors.bold('kernel11-chat')} - {who}"))
-    print(_box_line(f"  {Colors.gray('workspace/ - shell - web - grep.app')}"))
-    if agents:
-        names = " | ".join(f"{k} [{i}]" for i, k in enumerate(agents.keys(), 1))
-        print(_box_line(f"  {Colors.gray('agentes: ' + names + '  /agents troca')}"))
-    print(f"{SYM['box_bl']}{SYM['box_h'] * 52}{SYM['box_br']}")
+    if not agents:
+        return
+    sid = ""
+    try:
+        sid = str(agents.client.sid or "")
+    except Exception:
+        sid = ""
+    sid_txt = sid[:8] if sid else "----"
+    print(
+        f"{Colors.gray('Agent Mode:')} {Colors.bold(agents.label())}"
+        f"   {Colors.gray('Chat:')} {Colors.gray(sid_txt)}"
+    )
 
 
 def thinking_anim(stop_event: threading.Event):
-    frames = [SYM['dot'], SYM['star'], SYM['star2'], SYM['star3']]
-    i = 0
-    while not stop_event.is_set():
-        ch = frames[i % len(frames)]
-        sys.stdout.write(f"\r  {ch} Thinking...  ")
-        sys.stdout.flush()
-        i += 1
-        time.sleep(0.12)
-    sys.stdout.write("\r" + " " * 30 + "\r")
-    sys.stdout.flush()
+    return
 
 
 def enter_listener(interrupt_event: threading.Event, stop_event: threading.Event):
@@ -4741,14 +4627,8 @@ def main():
             client.load_chat(current_sid)
             resumed = True
             agents.bind(agents.current, current_sid)
-            print(
-                Colors.gray(
-                    f"agente {agents.label()} | retomando chat {current_sid[:8]} "
-                    "(use /new para comecar outro, /agents para trocar de agente)"
-                )
-            )
-        except Exception as e:
-            print(Colors.gray(f"nao consegui retomar o ultimo chat ({_clip(e, 120)}) - criando um novo"))
+        except Exception:
+            pass
 
     if not client.sid:
         ok, msg = agents.new_chat()
@@ -4757,20 +4637,7 @@ def main():
             return
 
     agents.remember_current()
-
     print_header(agents)
-    print(Colors.gray(
-        f"workspace {CONFIG.workspace.resolve()} | agente {agents.current} | chat {str(client.sid)[:8]}"
-    ))
-    print(Colors.gray("  /help para os comandos"))
-
-    if resumed:
-        try:
-            msgs = client.fetch_messages(client.sid)
-            if msgs:
-                print(Colors.gray(f"  {len(msgs)} mensagens neste chat (use /load <numero> para ver a lista)"))
-        except Exception:
-            pass
 
     commands = CommandHandler(client, storage, data, registry, workspace_mgr, agents)
 
@@ -4796,19 +4663,14 @@ def main():
             storage.save(data)
 
             prompt = agents.prompt().replace("__FILES__", workspace_mgr.list_files()) + f"\n\nUsuario: {q}\n"
-            start_time = time.time()
             interrupted = False
             resumo_buf: List[str] = []
             report_done = False
             auto_dorks: List[str] = []
 
-            print(f"  {Colors.gray(SYM['corner'] + ' Press Enter to stop')}")
-
-            # OSINT: pre-busca automatica antes do LLM (economiza 1 turno inteiro)
             pre_osint_text = ""
             if agents.current == "osint" and _looks_like_osint_target(q):
                 try:
-                    print_osint_banner(q)
                     pre_osint_text, _pre_dorks = osint_autopilot(
                         q, limit=10, fetches=2, progress=print_osint_progress
                     )
@@ -4820,8 +4682,8 @@ def main():
                             + pre_osint_text[:12000]
                             + "\n[FIM DA PRE-BUSCA]\n"
                         )
-                except Exception as e:
-                    print(f"  {Colors.gray(f'(pre-busca falhou: {type(e).__name__})')}")
+                except Exception:
+                    pass
 
             for loop in range(15):
                 buf: List[str] = []
@@ -4848,7 +4710,6 @@ def main():
                                 stop_evt.set()
                                 anim_t.join(timeout=0.5)
                                 first_chunk = False
-                                print()
                             buf.append(chunk)
                     except Exception as e:
                         if interrupt_evt.is_set():
@@ -4886,23 +4747,13 @@ def main():
                     if not cortado and not (vazio and continuations):
                         break
                     if continuations >= MAX_CONTINUATIONS:
-                        print(Colors.gray(
-                            f"  (resposta ainda cortada apos {MAX_CONTINUATIONS} continuacoes - "
-                            "peça em partes menores)"
-                        ))
                         break
 
                     continuations += 1
                     if vazio and not looks_truncated(parcial):
                         continue
-                    motivo = client.last_finish or "resposta incompleta"
-                    print("  " + Colors.gray(
-                        f"resposta cortada ({_clip(motivo, 40)}): continuando automaticamente "
-                        f"{continuations}/{MAX_CONTINUATIONS}..."
-                    ))
 
                 if interrupted:
-                    print(f"\n  {Colors.red('! Response stopped by user')}")
                     break
 
                 raw = "".join(buf)
@@ -4911,8 +4762,10 @@ def main():
                     clean = strip_dorks(clean)
                 if clean:
                     resumo_buf.append(clean)
-                if any(str(c.get("name", "")).startswith("osint_report") or str(c.get("name", "")) == "relatorio"
-                       for _, _, c in extract_tool_calls(raw)):
+                if any(
+                    str(c.get("name", "")).startswith("osint_report") or str(c.get("name", "")) == "relatorio"
+                    for _, _, c in extract_tool_calls(raw)
+                ):
                     report_done = True
 
                 if clean:
@@ -4923,8 +4776,6 @@ def main():
                     else:
                         print(f"\n{clean}\n")
 
-                # OSINT: o modelo gerou o relatorio? mostra na hora, colorido
-                # (antes o relatorio ia so pro proximo prompt e nunca aparecia na tela)
                 try:
                     for (_s, _e, _c), _res in zip(extract_tool_calls(raw), results):
                         if str(_c.get("name", "")) in ("osint_report", "relatorio"):
@@ -4938,25 +4789,21 @@ def main():
                     cur = workflow.get_current() if agents.current == "code" else None
                     if cur:
                         if cur.stage == "TESTAR" and cur.file_path:
-                            print(f"  {SYM['bullet']} auto workflow_test {cur.file_path}...")
                             auto_res = tool_workflow_test({"path": cur.file_path})
                             auto_workflow_results.append(auto_res)
                             results.append(auto_res)
                             used.append(f"used workflow_test {cur.file_path} auto...")
                         elif cur.stage == "ANALISAR" and cur.file_path:
-                            print(f"  {SYM['bullet']} auto workflow_analyze {cur.file_path}...")
                             auto_res = tool_workflow_analyze({"path": cur.file_path})
                             auto_workflow_results.append(auto_res)
                             results.append(auto_res)
                             used.append(f"used workflow_analyze {cur.file_path} auto...")
                         elif cur.stage == "APRESENTAR":
-                            print(f"  {SYM['bullet']} auto workflow_present...")
                             auto_res = tool_workflow_present({})
                             auto_workflow_results.append(auto_res)
                             results.append(auto_res)
                             used.append("used workflow_present auto...")
                         elif cur.stage == "ABRIR" and cur.file_path:
-                            print(f"  {SYM['bullet']} auto workflow_open {cur.file_path}...")
                             auto_res = tool_workflow_open({"path": cur.file_path})
                             auto_workflow_results.append(auto_res)
                             results.append(auto_res)
@@ -4966,8 +4813,6 @@ def main():
 
                 auto_osint_text = ""
                 if not used and agents.current == "osint" and loop == 0 and not pre_osint_text:
-                    # fallback: sem pre-busca e o modelo nao chamou tools - busca agora
-                    print(f"  {SYM['search']} {Colors.cyan('busca automatica...')}")
                     auto_osint_text, _auto_d = osint_autopilot(
                         q, limit=8, fetches=2, progress=print_osint_progress
                     )
@@ -4988,7 +4833,9 @@ def main():
                     dossier = auto_extract_dossier(evidencias, alvo=q)
                     descritos = _facts_from_answer(resumo_buf[-1] if resumo_buf else clean, 15)
                     vistos = {d["link"] for d in descritos}
-                    achados_auto = descritos + [f for f in _facts_from_text(evidencias, 15) if f["link"] not in vistos]
+                    achados_auto = descritos + [
+                        f for f in _facts_from_text(evidencias, 15) if f["link"] not in vistos
+                    ]
                     achados_auto += _phone_achados(evidencias, 8)
                     auto_rel = tool_osint_report({
                         "alvo": q,
@@ -5008,23 +4855,23 @@ def main():
                     report_done = True
 
                 if not used:
-                    data["history"].append({"role": "assistant", "content": clean, "time": datetime.datetime.now().isoformat()})
+                    data["history"].append({
+                        "role": "assistant",
+                        "content": clean,
+                        "time": datetime.datetime.now().isoformat(),
+                    })
                     storage.save(data)
                     registry.record(str(client.sid or ""), "assistant", clean)
                     break
 
                 diff_tracker.print_pending()
 
-                for u in used:
-                    if not u or u.endswith("auto..."):
-                        continue
-                    if u.startswith("fetched") or u.startswith("$"):
-                        print(f"  {SYM['corner']} {Colors.gray(u if not u.startswith('$') else '  ' + u)}")
-                    else:
-                        print(f"  {SYM['bullet']} {u}")
-
                 if auto_workflow_results:
-                    prompt = "Resultados (incluindo auto workflow):\n" + "\n".join(results) + f"\nArquivos:\n{workspace_mgr.list_files()}\nContinue o workflow ate CONCLUIDO."
+                    prompt = (
+                        "Resultados (incluindo auto workflow):\n"
+                        + "\n".join(results)
+                        + f"\nArquivos:\n{workspace_mgr.list_files()}\nContinue o workflow ate CONCLUIDO."
+                    )
                 elif auto_osint_text:
                     prompt = (
                         agents.prompt().replace("__FILES__", workspace_mgr.list_files())
@@ -5039,15 +4886,12 @@ def main():
                         "\n6. PROIBIDO inventar dado. Sem link = nao conta. Se nao achou, diga o que faltou e qual dork tentar."
                     )
                 else:
-                    prompt = "Resultados:\n" + "\n".join(results) + f"\nArquivos:\n{workspace_mgr.list_files()}\nContinue ou finalize."
+                    prompt = (
+                        "Resultados:\n" + "\n".join(results)
+                        + f"\nArquivos:\n{workspace_mgr.list_files()}\nContinue ou finalize."
+                    )
 
             diff_tracker.print_pending()
-            elapsed = time.time() - start_time
-            _extra = f" - {len(auto_dorks)} buscas" if agents.current == "osint" and auto_dorks else ""
-            if interrupted:
-                print(f"\n  {SYM['claude_dot']} {Colors.gray(f'Stopped - {elapsed:.1f}s{_extra}')}")
-            else:
-                print(f"\n  {SYM['claude_dot']} {Colors.gray(f'{elapsed:.1f}s{_extra}')}")
 
     finally:
         try:
